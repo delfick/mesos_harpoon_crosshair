@@ -78,41 +78,46 @@ def deploy_to_mesos(collector, image, artifact, **kwargs):
             return o.resolve()
         raise TypeError(repr(o) + " is not JSON serializable")
 
-    config = json.loads(json.dumps(mesos.config.as_dict(), default=serializer))
     c = MarathonClient(mesos.mesos_url)
 
     apps = c.list_apps()
-    wanted = mesos.deployment.id
-    if not wanted.startswith("/"):
-        wanted = "/{0}".format(wanted)
+    wanted = ["/{0}".format(name) for name in mesos.deployments]
 
-    found = None
+    found = {}
     for app in apps:
-        if app.id == wanted:
-            found = app
-            break
+        if app.id in wanted:
+            found[app.id[1:]] = app
 
-    if found is None:
-        app = MarathonApp(**config)
-        res = c.create_app(mesos.deployment.id, app)
-    else:
-        app = found
-        for key, val in config.items():
-            setattr(app, key, val)
-        res = c.update_app(mesos.deployment.id, app)
+    deployment_ids = {}
+    for name, deployment in mesos.deployments.items():
+        existing = found.get(name)
+        config = json.loads(json.dumps(deployment.config.as_dict(), default=serializer))
+        config["id"] = name
 
-    deployment_id = res["deploymentId"]
+        if existing is None:
+            app = MarathonApp(**config)
+            res = c.create_app(name, app)
+        else:
+            app = existing
+            for key, val in config.items():
+                setattr(app, key, val)
+            res = c.update_app(name, app)
+
+        deployment_ids[name] = res["deploymentId"]
+
     while True:
         deployments = c.list_deployments()
-        if not deployments:
-            break
 
+        found = False
         for d in deployments:
-            if d.id == deployment_id:
-                log.info("Waiting on deployment (%s)", deployment_id)
+            if d.id in deployment_ids.values():
+                log.info("Waiting on deployment (%s)", d.id)
                 for step in d.steps:
                     log.info("\t{0}".format(repr(step)))
-                break
+                found = True
+
+        if not found:
+            break
 
         time.sleep(1)
 
@@ -136,7 +141,6 @@ class an_image_spec(sb.Spec):
 ########################
 
 class Deployment(dictobj.Spec):
-    id = dictobj.Field(sb.string_spec, wrapper=sb.required)
     cmd = dictobj.Field(sb.string_spec, wrapper=sb.required)
     use_revision_tag = dictobj.Field(sb.boolean, default=False)
     application_options = dictobj.Field(sb.dictionary_spec, wrapper=sb.optional_spec)
@@ -145,7 +149,7 @@ class Deployment(dictobj.Spec):
 
     @property
     def config(self):
-        base = {"id": self.id, "cmd": self.cmd}
+        base = {"cmd": self.cmd}
         container = {"container": {"type": "DOCKER", "docker": {"image": self.docker_image}}}
         if self.use_revision_tag:
             tag = self.use_revision_tag
@@ -165,9 +169,5 @@ class Deployment(dictobj.Spec):
 class Mesos(dictobj.Spec):
     mesos_url = dictobj.Field(sb.string_spec, wrapper=sb.required)
     check_image_exists = dictobj.Field(sb.boolean, default=True)
-    deployment = dictobj.Field(Deployment.FieldSpec(formatter=MergedOptionStringFormatter))
+    deployments = dictobj.Field(sb.dictof(sb.string_spec(), Deployment.FieldSpec(formatter=MergedOptionStringFormatter)))
     environment_name = dictobj.Field(sb.string_spec, wrapper=sb.required)
-
-    @property
-    def config(self):
-        return self.deployment.config
